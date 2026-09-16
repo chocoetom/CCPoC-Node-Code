@@ -1,5 +1,5 @@
 const { ZERO_HASH, sha256hex, safeInt, safeBigInt, hashBlock, hashTransaction, evmTxHash, keccak256, merkleRoot, computeStateRoot, computeStateRootAfterTxs, computeContractStateRoot, verifySignature, calculateMiningReward, isBetterChainCandidate, canonicalTxMessage, blockMessage, signMessage, proofMessage, plotScoopCount, MINING_SCOOP_MODULUS, computeDeadline, verifyMerkleProofBuf, pubkeyToAddress, recoverTransactionSender } = require('../crypto-utils/crypto');
-const { runHook } = require('../bootstrap/optional');
+
 const { IncrementalStateRoot } = require('./state-trie');
 const { ZkpService } = require('../crypto-utils/zkp-service');
 const { SnapSyncService } = require('../snap/snap-service');
@@ -28,10 +28,7 @@ class Chain {
     this.height = 0;
     this.bestHash = ZERO_HASH;
     this.contracts = null;
-    this.optionalModules = null;
-    this._lastNotifiedHeight = -1;
-    this._acceptBurst = [];
-    this._bulkSyncWarned = false;
+
     try { this.db.prepare('ALTER TABLE transactions ADD COLUMN block_hash TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
     try { this.db.prepare('ALTER TABLE blocks ADD COLUMN base_target TEXT').run(); } catch (e) { /* already exists */ }
     try { this.db.prepare('ALTER TABLE blocks ADD COLUMN contract_state_root TEXT DEFAULT ""').run(); } catch (e) { /* already exists */ }
@@ -222,11 +219,14 @@ class Chain {
   }
 
   async addBlock(bloco, opts = {}) {
-    const { forceSync = false } = opts;
+    const { forceSync = false, allowEqualWork = false, allowVotedTie = false } = opts;
     const isLocalForge = !!bloco._from_local_forge;
     const blockOrigin = isLocalForge ? 'local' : 'network';
     delete bloco._from_local_forge;
     const height = bloco.height;
+    const parent = height > 0
+      ? this.db.prepare('SELECT height, timestamp, hash, chain_work, generation_signature FROM blocks WHERE hash = ?').get(bloco.parent_hash)
+      : null;
     if (typeof height !== 'number') return { ok: false, motivo: 'height missing' };
     if (!bloco.hash || !bloco.parent_hash) return { ok: false, motivo: 'hash or parent_hash missing' };
     if (this.db.prepare('SELECT 1 FROM blocks WHERE hash = ?').get(bloco.hash)) return { ok: true, motivo: 'already known' };
@@ -237,7 +237,6 @@ class Chain {
     if (bloco.miner) bloco.miner = normalizeAddr(bloco.miner);
     if (Array.isArray(bloco.rewards)) bloco.rewards.forEach(r => { if (r.miner) r.miner = normalizeAddr(r.miner); });
     if (height > 0) {
-      const parent = this.db.prepare('SELECT height, timestamp, hash, chain_work FROM blocks WHERE hash = ?').get(bloco.parent_hash);
       if (!parent) return { ok: false, motivo: 'parent not found' };
       if (parent.height !== height - 1) return { ok: false, motivo: 'height sequence error' };
       const medianTimes = this.db.prepare('SELECT timestamp FROM blocks WHERE height <= ? ORDER BY height DESC LIMIT 11').all(parent.height).map(r => safeInt(r.timestamp, 0)).sort((a, b) => a - b);
@@ -311,8 +310,17 @@ class Chain {
 
       if (height > 0) {
         if (!bloco.challenge_id) return { ok: false, motivo: 'block missing challenge_id' };
-        const challenge = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ?').get(bloco.challenge_id);
-        if (!challenge) return { ok: false, motivo: 'unknown mining challenge' };
+        const winnerProof = bloco.winner_proof && typeof bloco.winner_proof === 'object' ? bloco.winner_proof : {};
+        const storedChallenge = this.db.prepare('SELECT * FROM mining_challenges WHERE challenge_id = ?').get(bloco.challenge_id);
+        const challenge = storedChallenge || {
+          challenge_id: bloco.challenge_id,
+          challenge_seed: String(winnerProof.challenge_seed || ''),
+          block_height: height - 1,
+          winner_miner: bloco.miner,
+          winner_deadline: safeInt(winnerProof.deadline, -1),
+          created_at: safeInt(bloco.challenge_created_at, safeInt(parent.timestamp, 0)),
+          finalized_at: 1,
+        };
         if (!challenge.finalized_at || !challenge.winner_miner || safeInt(challenge.winner_deadline, -1) < 0) return { ok: false, motivo: 'challenge has no finalized winner' };
         if (normalizeAddr(challenge.winner_miner) !== normalizeAddr(bloco.miner || '')) return { ok: false, motivo: 'block miner is not challenge winner' };
         const expectedChallengeId = sha256hex(`${String(challenge.challenge_seed || '')}:${String(parent.hash)}`);
@@ -416,7 +424,15 @@ class Chain {
     if (existingAtHeight && existingAtHeight.hash !== bloco.hash) {
       if (forceSync) {
         if (height <= this.height - FINALIZATION_DEPTH) return { ok: false, motivo: 'cannot replace finalized block during sync' };
-        if (newWork <= safeBigInt(existingAtHeight.chain_work, 0n)) return { ok: false, motivo: 'forced candidate does not have more chain work' };
+        const incumbent = this.getBlockByHash(existingAtHeight.hash);
+        const incumbentWork = safeBigInt(existingAtHeight.chain_work, 0n);
+        const equalWorkTie = newWork === incumbentWork
+          && allowEqualWork
+          && (allowVotedTie || isBetterChainCandidate(bloco, incumbent));
+        if (newWork < incumbentWork) return { ok: false, motivo: 'forced candidate does not have more chain work' };
+        if (newWork === incumbentWork && !equalWorkTie) {
+          return { ok: false, motivo: 'forced candidate does not have more chain work or a valid tie-break' };
+        }
         log('debug', `addBlock forceSync h=${height} local=${existingAtHeight.hash.slice(0, 10)} remote=${bloco.hash.slice(0, 10)}`);
         const doomed = this.getBlockByHash(existingAtHeight.hash);
         if (doomed && doomed.miner && doomed.miner !== 'genesis') this._rollbackRewardsForBlocks(doomed.miner, doomed.reward_cc);
@@ -424,9 +440,10 @@ class Chain {
         this.db.prepare('DELETE FROM contract_logs WHERE block_hash = ?').run(existingAtHeight.hash);
         this.db.prepare('DELETE FROM blocks WHERE hash = ?').run(existingAtHeight.hash);
         log('debug', `addBlock forceSync: replaced incumbent ${existingAtHeight.hash.slice(0, 10)} at h=${height}`);
-      } else if (isBetterChainCandidate(bloco, this.getBlockByHash(existingAtHeight.hash))) {
+      } else if (isBetterChainCandidate(bloco, this.getBlockByHash(existingAtHeight.hash))
+        || (allowVotedTie && newWork === safeBigInt(existingAtHeight.chain_work, 0n))) {
         log('debug', `addBlock better candidate h=${height} local=${existingAtHeight.hash.slice(0, 10)} remote=${bloco.hash.slice(0, 10)}`);
-        const reorgResult = await this.reorganize(bloco);
+        const reorgResult = await this.reorganize(bloco, false, allowVotedTie);
         if (!reorgResult.ok) return { ok: false, motivo: `reorg failed: ${reorgResult.motivo}` };
         return { ok: true, motivo: 'reorganized to better tip', height: this.height, hash: this.bestHash };
       } else {
@@ -575,8 +592,6 @@ class Chain {
         this._selectTip();
       })();
       if (height > 0) log('info', `Block #${height} accepted [${bloco.hash.slice(0, 10)}] from ${blockOrigin} (miner: ${(bloco.miner || '').slice(0, 10)}…)`);
-      this._maybeNotifyNewBlock(bloco, isLocalForge);
-      if (!isLocalForge && this.bestHash === bloco.hash);
       return { ok: true, motivo: 'block added', height, hash: bloco.hash };
     } catch (e) {
       if (contractExec) { try { contractExec.rollback(); } catch {} }
@@ -584,26 +599,6 @@ class Chain {
     }
   }
 
-  _maybeNotifyNewBlock(bloco, isLocalForge) {
-    if (isLocalForge) return;
-    if (!this.optionalModules) return;
-    const height = bloco ? bloco.height : 0;
-    if (height <= this._lastNotifiedHeight || this.bestHash !== bloco.hash) return;
-    const now = Date.now();
-    this._acceptBurst.push(now);
-    const cutoff = now - 20000;
-    this._acceptBurst = this._acceptBurst.filter((t) => t >= cutoff);
-    if (this._acceptBurst.length > 8) {
-      if (!this._bulkSyncWarned) {
-        this._bulkSyncWarned = true;
-        log('info', `[DISCORD] bulk sync detected (~${this._acceptBurst.length} blocks in 20s) — suppressing per-block notifications`);
-      }
-      return;
-    }
-    this._bulkSyncWarned = false;
-    this._lastNotifiedHeight = height;
-    runHook(this.optionalModules, 'notifyNewBlock', bloco, this.cfg);
-  }
 
   _blockContext(bloco) {
     try {
@@ -776,7 +771,7 @@ class Chain {
     return Math.max(600, Math.min(86400, Math.floor(expected * 36000 / Math.max(capacity, 1))));
   }
 
-  async reorganize(targetOrHash, forceSync) {
+  async reorganize(targetOrHash, forceSync = false, allowVotedTie = false) {
     const target = typeof targetOrHash === 'string' ? this.getBlockByHash(targetOrHash) : targetOrHash;
     if (!target) return { ok: false, motivo: 'target block not found' };
     if (target.height >= this.height && this.getBlock(target.height) && this.getBlock(target.height).hash === target.hash) {
@@ -801,7 +796,7 @@ class Chain {
         if (h === target.hash) blk = target;
         else return { ok: false, motivo: `block ${h} not in DB` };
       }
-      const res = await this.addBlock(blk, { forceSync: true });
+      const res = await this.addBlock(blk, { forceSync: true, allowEqualWork: true, allowVotedTie });
       if (!res.ok) return { ok: false, motivo: res.motivo };
     }
     const finalizeReorg = this.db.transaction(() => {
@@ -917,6 +912,21 @@ class Chain {
         const cur = this.db.prepare('SELECT nonce FROM users WHERE address = ?').get(addr);
         if (cur && safeInt(cur.nonce, 0) < nonces[addr]) this.db.prepare('UPDATE users SET nonce = ?, updated_at = ? WHERE address = ?').run(nonces[addr], now, addr);
       }
+    }
+    try {
+      const locked = new Map();
+      const rows = this.db.prepare(`SELECT v.voter, v.stake FROM fork_votes v
+        JOIN fork_vote_rounds r ON r.vote_id = v.vote_id
+        WHERE r.status = 'pending'`).all();
+      for (const row of rows) {
+        locked.set(row.voter, (locked.get(row.voter) || 0n) + safeBigInt(row.stake, 0n));
+      }
+      for (const [address, amount] of locked) {
+        const user = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(address);
+        if (user) this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(safeBigInt(user.balance, 0n) - amount), now, address);
+      }
+    } catch (e) {
+      log('warn', `Fork vote lock reconciliation: ${e.message}`);
     }
   }
 

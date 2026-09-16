@@ -12,7 +12,6 @@ const { PeerManager } = require('../P2P/peers');
 const { SyncEngine } = require('../P2P/sync');
 const { Server } = require('../api/server');
 const { P2PWebSocketServer } = require('../P2P/p2p-ws');
-const { setupOptionalModules, loadOptionalModules } = require('./optional');
 
 class NodeRegistry {
   constructor(db) {
@@ -61,16 +60,6 @@ class ChocoNode {
 
     this._printBanner();
 
-    try {
-      await setupOptionalModules(cfg);
-    } catch (e) {
-      log('warn', `Optional modules setup skipped: ${e.message}`);
-    }
-    this.optionalModules = loadOptionalModules();
-    if (Object.keys(this.optionalModules).length > 0) {
-      log('info', `Optional modules hooks: ${Object.keys(this.optionalModules).join(', ')}`);
-    }
-
     this.db = initDB(cfg.dbPath, cfg);
     this.smartContracts = null;
     if (cfg.smartContractsEnabled) {
@@ -88,11 +77,10 @@ class ChocoNode {
     }
 
     this.chain = new Chain(this.db, cfg);
-    this.chain.optionalModules = this.optionalModules;
     if (this.smartContracts) this.chain.setContractExecutor(this.smartContracts);
     this.peers = new PeerManager(this.db, cfg);
     for (const seed of (cfg.seedPeers || [])) this.peers.add(seed);
-    this.challengeMgr = new ChallengeManager(this.db, this.chain, cfg, this.optionalModules);
+    this.challengeMgr = new ChallengeManager(this.db, this.chain, cfg);
     if (!cfg.minerPrivateKey || !String(cfg.minerAddress || '')) {
       log('warn', `[FORGE] No minerPrivateKey/minerAddress configured — this node will NOT forge blocks (set MINER_PRIVATE_KEY to enable)`);
     }

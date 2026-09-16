@@ -1,14 +1,14 @@
 const crypto = require('crypto');
 const { ZERO_HASH, sha256hex, sha256buf, safeInt, safeBigInt, hashBlock, hashTransaction, merkleRoot, computeStateRootAfterTxs, calculateMiningReward, verifyMerkleProofBuf, computeDeadline, plotScoopCount, SCOOPS_PER_NONCE, MINING_SCOOP_MODULUS, verifySignature, canonicalTxMessage, proofMessage, recoverTransactionSender } = require('../crypto-utils/crypto');
 const { log } = require('../../config/config');
-const { runHook } = require('../bootstrap/optional');
+
 
 class ChallengeManager {
-  constructor(db, chain, cfg, optionalModules = null) {
+  constructor(db, chain, cfg) {
     this.db = db;
     this.cfg = cfg || {};
     this.chain = chain;
-    this.optionalModules = optionalModules;
+
     this._forging = new Set();
   }
 
@@ -360,7 +360,6 @@ class ChallengeManager {
     }
       this.db.prepare('UPDATE mining_challenges SET forged_block_height = ? WHERE challenge_id = ? AND forged_block_height IS NULL').run(block.height, challenge.challenge_id);
       log('info', `Block #${block.height} forged — challenge ${challenge.challenge_id.slice(0, 12)} (winner ${winner.miner.slice(0, 10)}…, reward ${totalReward} CC)`);
-      runHook(this.optionalModules, 'notifyNewBlock', block, this.cfg);
       if (syncEngine) setImmediate(() => { syncEngine.broadcastBlock(block); });
       return block;
     } catch (e) { log('error', `forge error: ${e.message}`); return null; } 

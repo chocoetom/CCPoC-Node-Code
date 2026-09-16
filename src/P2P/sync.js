@@ -87,6 +87,33 @@ class SyncEngine {
     }));
   }
 
+  async _syncPeerPlots(peerUrl) {
+    try {
+      const data = await fetchJSON(`${peerUrl.replace(/\/+$/, '')}/api/plots/announced`, { timeout: 10 });
+      if (!data || !Array.isArray(data.plots)) return 0;
+      const originUrl = String(data.node_url || peerUrl);
+      let stored = 0;
+      for (const ann of data.plots) {
+        const check = verifyAnnouncement(ann, { requireVrf: true, requireSig: true });
+        if (!check.ok) continue;
+        this.db.prepare(`INSERT OR REPLACE INTO peer_plot_commitments
+          (plot_id, miner, merkle_root, size_gb, node_url, vrf_public_key, vrf_output, vrf_proof, signature, public_key, created_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+          String(ann.plot_id), String(ann.miner).toLowerCase(), String(ann.merkle_root),
+          parseFloat(ann.size_gb) || 0, originUrl, String(ann.vrf_public_key || ''),
+          String(ann.vrf_output || ''), JSON.stringify(ann.vrf_proof || ''),
+          String(ann.signature || ''), String(ann.public_key || ''), Math.floor(Date.now() / 1000),
+        );
+        stored++;
+      }
+      if (stored > 0) log('debug', `sync: loaded ${stored} verified plot announcements from ${peerUrl}`);
+      return stored;
+    } catch (e) {
+      log('debug', `sync: plot bootstrap from ${peerUrl} failed: ${e.message}`);
+      return 0;
+    }
+  }
+
   async loopSync() {
     const now = Date.now();
     const cooldown = Math.max(2000, this.cfg.syncIntervalMs || 10000);
@@ -113,6 +140,7 @@ class SyncEngine {
           ));
           if (!remoteBetter) continue;
           log('debug', `loopSync: peer=${peer.url} remoteHeight=${remoteHeight} remoteWork=${remote.chain_work} localHeight=${this.chain.height} localWork=${localTip ? localTip.chain_work : 0}`);
+          await this._syncPeerPlots(peer.url);
           const synced = await this._syncFromPeer(peer.url, remoteHeight);
           if (synced) break;
         } catch (e) { log('debug', `loopSync: peer=${peer.url} error=${e.message}`); }
@@ -418,6 +446,24 @@ class SyncEngine {
     const peers = this.peers.active(10);
     await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/broadcast/tx`, {
       method: 'POST', body: { tx }, timeout: 5,
+    })));
+  }
+
+  async broadcastForkVote(vote) {
+    const key = `fork-vote:${vote && vote.vote_id}:${vote && vote.voter}`;
+    if (!this._rememberBroadcast(key)) return { deduped: true };
+    const peers = this.peers.active(10);
+    await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/vote/request`, {
+      method: 'POST', body: { ...vote, _relayed: true }, timeout: 8,
+    })));
+  }
+
+  async broadcastForkVoteFinalize(request) {
+    const key = `fork-vote-finalize:${request && request.vote_id}`;
+    if (!this._rememberBroadcast(key)) return { deduped: true };
+    const peers = this.peers.active(10);
+    await Promise.allSettled(peers.map(peer => fetchJSON(`${peer.url}/api/node/vote/finalize`, {
+      method: 'POST', body: { ...request, _relayed: true }, timeout: 8,
     })));
   }
 

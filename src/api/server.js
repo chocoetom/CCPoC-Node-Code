@@ -1,11 +1,25 @@
 const path = require('path');
-const crypto = require('crypto');
-const os = require("os");
-const { safeInt, safeBigInt, sha256hex, hashTransaction, pubkeyToAddress, pubKeyToAddress, privateKeyToAddress, toChecksumAddress, calculateMiningReward, hashBlock, signMessage, canonicalTxMessage, verifySignature, plotRegisterMessage, evmTxHash, recoverTransactionSender, signatureToHex, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
+const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, verifySignature, plotRegisterMessage, forkVoteMessage, evmTxHash, recoverTransactionSender, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
 const { log, getLogBuffer } = require('../../config/config');
 const MAX_PLOT_GB = require('../crypto-utils/plot-capacity').MAX_PLOT_GB;
 const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { estimateIntrinsicGas, minimumFee } = require('../consensus/gas');
+
+const CC_SCALE = 10n ** 18n;
+function parseCcAmount(value) {
+  const text = String(value ?? '').trim();
+  const match = /^(\d+)(?:\.(\d{1,18}))?$/.exec(text);
+  if (!match) return null;
+  const fraction = (match[2] || '').padEnd(18, '0');
+  return BigInt(match[1]) * CC_SCALE + BigInt(fraction || '0');
+}
+
+function formatCcAmount(units) {
+  const value = safeBigInt(units, 0n);
+  const whole = value / CC_SCALE;
+  const fraction = (value % CC_SCALE).toString().padStart(18, '0').replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : String(whole);
+}
 
 const rateLimitStore = new Map();
 function rateLimit(options = {}) {
@@ -73,15 +87,15 @@ class Server {
       const gossip = this.peers.gossipPeers(50);
       const results = [];
       const fetches = gossip.map(async (p) => {
-        try {
-          const controller = new AbortController();
+        const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 4000);
-          const res = await fetch(p.url + '/api/stats', { signal: controller.signal });
-          clearTimeout(timer);
-          if (!res.ok) return null;
-          const d = await res.json();
-          return { url: p.url, node_id: p.node_id, plots_count: d.plots_count || 0, capacity_gb: Number(d.capacidade_gb) || 0, height: d.height || 0 };
-        } catch { return null; }
+          try {
+            const res = await fetch(p.url + '/api/stats', { signal: controller.signal });
+            if (!res.ok) return null;
+            const d = await res.json();
+            return { url: p.url, node_id: p.node_id, plots_count: d.plots_count || 0, capacity_gb: Number(d.capacity_gb) || 0, height: d.height || 0 };
+          } catch { return null; }
+          finally { clearTimeout(timer); }
       });
       const settled = await Promise.allSettled(fetches);
       for (const r of settled) {
@@ -90,10 +104,69 @@ class Server {
       const st = this.chain.getStats();
       this._peerStorageCache = {
         peers: results,
-        local: { plots_count: st.plots_count || 0, capacidade_gb: Number(st.capacidade_gb) || 0 },
+        local: { plots_count: st.plots_count || 0, capacity_gb: Number(st.capacity_gb) || 0 },
         fetched_at: Date.now(),
       };
     } catch (e) { /* noop */ }
+  }
+
+  _forkVoteTally(voteId) {
+    const rows = this.db.prepare('SELECT block_hash, stake FROM fork_votes WHERE vote_id = ?').all(voteId);
+    const totals = new Map();
+    for (const row of rows) {
+      totals.set(row.block_hash, (totals.get(row.block_hash) || 0n) + safeBigInt(row.stake, 0n));
+    }
+    return [...totals.entries()]
+      .map(([block_hash, stake]) => ({ block_hash, stake: String(stake), stake_cc: formatCcAmount(stake) }))
+      .sort((a, b) => {
+        const aStake = safeBigInt(a.stake, 0n);
+        const bStake = safeBigInt(b.stake, 0n);
+        if (aStake !== bStake) return aStake > bStake ? -1 : 1;
+        return a.block_hash < b.block_hash ? -1 : a.block_hash > b.block_hash ? 1 : 0;
+      });
+  }
+
+  _finishForkVote(voteId, result, resultHash, reorgApplied) {
+    const now = Math.floor(Date.now() / 1000);
+    this.db.transaction(() => {
+      if (!reorgApplied) {
+        const locks = this.db.prepare('SELECT voter, stake FROM fork_votes WHERE vote_id = ?').all(voteId);
+        for (const lock of locks) {
+          const user = this.db.prepare('SELECT balance FROM users WHERE address = ?').get(lock.voter);
+          if (!user) continue;
+          const balance = safeBigInt(user.balance, 0n) + safeBigInt(lock.stake, 0n);
+          this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE address = ?').run(String(balance), now, lock.voter);
+        }
+      }
+      this.db.prepare("UPDATE fork_vote_rounds SET status = 'finalized', finalized_at = ?, result_hash = ?, result = ? WHERE vote_id = ? AND status = 'finalizing'")
+        .run(now, resultHash || '', result, voteId);
+    })();
+  }
+
+  _isCanonicalHash(hash) {
+    let current = this.chain.getBlock(this.chain.height);
+    const seen = new Set();
+    while (current && current.hash && !seen.has(current.hash)) {
+      if (current.hash === hash) return true;
+      seen.add(current.hash);
+      current = current.parent_hash ? this.chain.getBlockByHash(current.parent_hash) : null;
+    }
+    return false;
+  }
+
+  _recoverFinalizingForkVotes() {
+    const rounds = this.db.prepare("SELECT vote_id, result, result_hash FROM fork_vote_rounds WHERE status = 'finalizing'").all();
+    for (const round of rounds) {
+      const reorgApplied = round.result === 'reorg_pending'
+        && !!round.result_hash
+        && this._isCanonicalHash(round.result_hash);
+      this._finishForkVote(
+        round.vote_id,
+        reorgApplied ? 'reorganized_recovered' : 'recovered_no_reorg',
+        reorgApplied ? round.result_hash : this.chain.bestHash,
+        reorgApplied,
+      );
+    }
   }
 
   start() {
@@ -101,6 +174,7 @@ class Server {
     const helmet = require('helmet');
     const app = express();
     this.app = app;
+    this._recoverFinalizingForkVotes();
 
     const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -134,26 +208,10 @@ class Server {
 
     app.use(apiLimiter);
 
-    app.get('/', (req, res) => {
-      const stats = this.chain.getStats();
-      const tip = this.chain.getBlock(this.chain.height);
-      const ns = this.registry.getStats();
-      res.json({
-        ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
-        symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
-        current_reward_cc: Number(calculateMiningReward(this.chain.height + 1, this.cfg)) / 1e18,
-        blocks_to_halving: this.cfg.halvingInterval - (this.chain.height % this.cfg.halvingInterval),
-        halving_interval: this.cfg.halvingInterval, max_supply: this.cfg.maxSupply,
-        seed_version: this.cfg.version, node_url: this.cfg.nodeUrl,
-        node_id: this.NODE_ID, peers: { total: this.peers.count(), active: this.peers.active().length, banned: this.peers.banned().length, avg_health: 0 },
-        version: this.cfg.version,
-      });  
-    });
+    app.get('/', (req, res) => res.redirect('/api/stats'));
 
     app.get('/api/stats', (req, res) => {
       const stats = this.chain.getStats();
-      const tip = this.chain.getBlock(this.chain.height);
-      const ns = this.registry.getStats();
       res.json({
         ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
         symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
@@ -163,24 +221,6 @@ class Server {
         seed_version: this.cfg.version, node_url: this.cfg.nodeUrl,
         node_id: this.NODE_ID, peers: { total: this.peers.count(), active: this.peers.active().length, banned: this.peers.banned().length, avg_health: 0 },
         version: this.cfg.version,
-      });
-    });
-
-    // Admin only stats, such as node performance and others, this would be on public endpoint but it looks not professional
-    app.get('/api/stats/admin', requireAdmin, (req, res) => {
-      const stats = this.chain.getStats();
-      const memory_free = os.freemem() / Math.pow(1024, 3);
-      const memory_total = os.totalmem() / Math.pow(1024, 3);
-      const memory_usage = memory_free / memory_total;
-      res.json({
-        ...stats, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
-        symbol: this.cfg.symbol, current_reward: calculateMiningReward(this.chain.height + 1, this.cfg).toString(),
-        current_reward_cc: Number(calculateMiningReward(this.chain.height + 1, this.cfg)) / 1e18,
-        blocks_to_halving: this.cfg.halvingInterval - (this.chain.height % this.cfg.halvingInterval),
-        halving_interval: this.cfg.halvingInterval, max_supply: this.cfg.maxSupply,
-        seed_version: this.cfg.version, node_url: this.cfg.nodeUrl,
-        node_id: this.NODE_ID, peers: { total: this.peers.count(), active: this.peers.active().length, banned: this.peers.banned().length, avg_health: 0 },
-        version: this.cfg.version, memory_usage: memory_usage, memory_free: memory_free,
       });
     });
 
@@ -193,7 +233,6 @@ app.get('/api/state', (req, res) => {
     running,
     config: {
       port: config.port,
-      minerAddress: config.minerAddress,
       chainId: config.chainId,
       chainName: config.chainName,
       symbol: config.symbol
@@ -203,14 +242,13 @@ app.get('/api/state', (req, res) => {
       balance: w.balance,
       nonce: w.nonce
     })),
-    miner_unlocked: !!config.minerPrivateKey,
     node: node ? {
       height: node.height,
       hash: node.hash,
       peers: node.blocks ? node.blocks.length : 0
     } : null,
     network_storage: {
-      local: { plots_count: node ? node.plots_count : 0, capacidade_gb: node ? Number(node.capacidade_gb || 0) : 0 },
+      local: { plots_count: node ? node.plots_count : 0, capacity_gb: node ? Number(node.capacity_gb || 0) : 0 },
       peers: []
     },
     data_dir: config.dataDir
@@ -446,7 +484,7 @@ app.get('/api/state', (req, res) => {
       height: this.chain.height, hash: this.chain.bestHash,
       chain_work: (this.chain.getBlock(this.chain.height) || {}).chain_work || '0',
       peer_count: this.peers.count(), mining_active: false,
-      miner_address: this.cfg.minerAddress || '', node_url: this.cfg.nodeUrl,
+      node_url: this.cfg.nodeUrl,
     }));
     app.get('/api/node/peers', (req, res) => res.json({ peers: this.peers.all(100) }));
     app.get('/api/node/peers/gossip', (req, res) => res.json({ peers: this.peers.gossipPeers(50) }));
@@ -744,102 +782,6 @@ const validation = await this.chain.validateTxForMempool(tx);
       }
     });
 
-    const p2pExchangeEnabled = () => !!this.cfg.p2pExchangeEnabled;
-    const p2pExchangeDisabled = (res) => res.status(503).json({ error: 'P2P exchange disabled on this node', enabled: false });
-
-    let p2pExchange = null;
-    if (p2pExchangeEnabled()) {
-      try {
-        const { P2PExchange } = require('../vm/p2p-exchange');
-        p2pExchange = new P2PExchange(this.chain, this.cfg);
-        p2pExchange.initSchema();
-        log('info', `[P2P-EXCHANGE] P2P exchange enabled`);
-      } catch (e) {
-        log('warn', `[P2P-EXCHANGE] Failed to initialize: ${e.message}`);
-      }
-    }
-
-    app.get('/api/p2p/assets', (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      res.json({ assets: p2pExchange.listAssets() });
-    });
-
-    app.post('/api/p2p/offers', mutationLimiter, async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      try {
-        const result = await p2pExchange.createOffer(req.body);
-        res.json(result);
-      } catch (e) {
-        res.status(400).json({ error: e.message });
-      }
-    });
-
-    app.get('/api/p2p/offers', async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      const { pluginId, asset, status, limit, offset } = req.query;
-      const result = await p2pExchange.listOffers({
-        pluginId, asset, status, limit: parseInt(limit) || 50, offset: parseInt(offset) || 0
-      });
-      res.json(result);
-    });
-
-    app.get('/api/p2p/offers/:id', async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      const result = await p2pExchange.getOffer(req.params.id);
-      res.json(result);
-    });
-
-    app.get('/api/p2p/offers/:id/status', async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      const result = await p2pExchange.getOfferStatus(req.params.id);
-      res.json(result);
-    });
-
-    app.post('/api/p2p/offers/:id/take', requireAdmin, mutationLimiter, async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      try {
-        const result = await p2pExchange.takeOffer({ offerId: req.params.id, ...req.body });
-        res.json(result);
-      } catch (e) {
-        res.status(400).json({ error: e.message });
-      }
-    });
-
-    app.post('/api/p2p/offers/:id/claim', requireAdmin, mutationLimiter, async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      try {
-        const result = await p2pExchange.claimOffer({ offerId: req.params.id, ...req.body });
-        res.json(result);
-      } catch (e) {
-        res.status(400).json({ error: e.message });
-      }
-    });
-
-    app.post('/api/p2p/offers/:id/refund', requireAdmin, mutationLimiter, async (req, res) => {
-      if (!p2pExchangeEnabled()) return p2pExchangeDisabled(res);
-      if (!p2pExchange) return res.status(500).json({ error: 'P2P exchange not initialized' });
-      try {
-        const result = await p2pExchange.refundOffer({ offerId: req.params.id, ...req.body });
-        res.json(result);
-      } catch (e) {
-        res.status(400).json({ error: e.message });
-      }
-    });
-
-    app.post('/api/stake', requireAdmin, (req, res) => {
-      const { amount, address } = req.body;
-      if (!amount || !address) return res.status(400).json({ error: 'amount and address required' });
-      res.json({ ok: true, amount: String(amount), address, stakeId: 'stake_' + Date.now() });
-      log('info', `[STAKE] Received stake request: amount=${amount}, address=${address}`);
-    });
-
     app.post('/api/node/settings', requireAdmin, (req, res) => {
       const updates = req.body;
       if (!updates || typeof updates !== 'object') return res.status(400).json({ error: 'settings object required' });
@@ -887,11 +829,6 @@ const validation = await this.chain.validateTxForMempool(tx);
     });
 
     app.get('/peers', (req, res) => res.json({ peers: this.peers.gossipPeers(50), count: this.peers.count() }));
-    app.get('/stats', (req, res) => {
-      const ns = this.registry.getStats();
-      res.json({ ...ns, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName, symbol: this.cfg.symbol, seed_version: this.cfg.version, node_url: this.cfg.nodeUrl, node_id: this.NODE_ID });
-    });
-
     app.post('/register', p2pLimiter, (req, res) => {
       const url = require('../../config/config').normalizeUrl(req.body.url);
       if (!url || !req.body.node_id) return res.status(400).json({ error: 'url and node_id required' });
@@ -912,11 +849,138 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json(result);
     });
 
-    app.post('/api/node/vote/request', (req, res) => {
-      const { vote_id, proposer } = req.body;
-      if (!vote_id || !proposer) return res.status(400).json({ error: 'vote_id and proposer required' });
-      log('info', `[P2P] Vote request: vote_id=${vote_id}, proposer=${proposer}`);
-      res.json({ vote_id, approve: true, reason: 'accepted', voter_address: this.cfg.minerAddress || '', stake: 0 });
+    app.post('/api/node/vote/request', p2pLimiter, async (req, res) => {
+      const { vote_id, proposer, block_hash, block, voter, stake_cc, public_key, signature } = req.body || {};
+      const voteId = String(vote_id || '').trim();
+      const candidateHash = String(block_hash || '').toLowerCase();
+      const voterAddress = String(voter || '').toLowerCase();
+      if (!voteId || voteId.length > 128 || !proposer || !/^[0-9a-f]{64}$/.test(candidateHash) || !voterAddress || !public_key || !signature) {
+        return res.status(400).json({ error: 'vote_id, proposer, block_hash, voter, stake_cc, public_key, and signature required' });
+      }
+      const stake = parseCcAmount(stake_cc);
+      if (stake == null || stake <= 0n) return res.status(400).json({ error: 'stake_cc must be a positive decimal amount with up to 18 decimals' });
+      if (!/^0x[0-9a-f]{40}$/.test(voterAddress)) return res.status(400).json({ error: 'invalid voter address' });
+
+      const localTip = this.chain.getBlock(this.chain.height);
+      const candidate = block || this.chain.getBlockByHash(candidateHash);
+      if (!candidate) return res.status(404).json({ error: 'candidate block not found; include block in the request' });
+      if (String(candidate.hash || '').toLowerCase() !== candidateHash) {
+        return res.status(400).json({ error: 'block_hash does not match candidate block' });
+      }
+      if (!localTip || safeInt(candidate.height, -1) !== this.chain.height) {
+        return res.status(409).json({ error: 'vote is only valid for a competing block at the current tip height' });
+      }
+      if (safeInt(candidate.height, 0) > 0 && !this.chain.getBlockByHash(candidate.parent_hash)) {
+        return res.status(409).json({ error: 'candidate parent is not known by this node' });
+      }
+
+      try {
+        if (pubkeyToAddress(public_key).toLowerCase() !== voterAddress) {
+          return res.status(400).json({ error: 'voter address does not match public key' });
+        }
+        const user = this.db.prepare('SELECT address, balance, public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(voterAddress);
+        if (!user || !user.public_key_secp256k1) return res.status(403).json({ error: 'voter wallet is not registered with a public key' });
+        if (pubkeyToAddress(user.public_key_secp256k1).toLowerCase() !== voterAddress) {
+          return res.status(403).json({ error: 'registered voter key does not match voter address' });
+        }
+        const message = forkVoteMessage(voteId, candidateHash, voterAddress, stake.toString());
+        if (!verifySignature(message, signature, public_key)) return res.status(401).json({ error: 'invalid vote signature' });
+
+        let duplicate = false;
+        this.db.transaction(() => {
+          const round = this.db.prepare('SELECT height, status FROM fork_vote_rounds WHERE vote_id = ?').get(voteId);
+          if (round && round.status !== 'pending') {
+            const e = new Error('vote round is already finalized'); e.status = 409; throw e;
+          }
+          if (round && safeInt(round.height, -1) !== safeInt(candidate.height, -1)) {
+            const e = new Error('vote round height does not match candidate'); e.status = 409; throw e;
+          }
+          const existing = this.db.prepare('SELECT block_hash, stake FROM fork_votes WHERE vote_id = ? AND voter = ?').get(voteId, voterAddress);
+          if (existing) {
+            if (existing.block_hash !== candidateHash || String(existing.stake) !== stake.toString()) {
+              const e = new Error('voter has already voted differently in this round'); e.status = 409; throw e;
+            }
+            duplicate = true;
+            return;
+          }
+          const balance = safeBigInt((this.db.prepare('SELECT balance FROM users WHERE lower(address) = lower(?)').get(voterAddress) || {}).balance, -1n);
+          if (balance < stake) {
+            const e = new Error('insufficient available balance for vote stake'); e.status = 409; throw e;
+          }
+          const now = Math.floor(Date.now() / 1000);
+          this.db.prepare("INSERT OR IGNORE INTO fork_vote_rounds (vote_id, height, status, created_at) VALUES (?, ?, 'pending', ?)").run(voteId, candidate.height, now);
+          this.db.prepare('INSERT OR IGNORE INTO fork_vote_candidates (vote_id, block_hash, height, block_json, created_at) VALUES (?,?,?,?,?)')
+            .run(voteId, candidateHash, candidate.height, JSON.stringify(candidate), now);
+          this.db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE lower(address) = lower(?)')
+            .run(String(balance - stake), now, voterAddress);
+          this.db.prepare('INSERT INTO fork_votes (vote_id, block_hash, voter, stake, public_key, signature, created_at) VALUES (?,?,?,?,?,?,?)')
+            .run(voteId, candidateHash, voterAddress, stake.toString(), public_key, signature, now);
+        })();
+
+        const tally = this._forkVoteTally(voteId);
+        const payload = {
+          vote_id: voteId, proposer, block_hash: candidateHash, block: candidate,
+          voter: voterAddress, stake_cc: String(stake_cc), public_key, signature, _relayed: true,
+        };
+        if (!(req.body || {})._relayed && this.sync && typeof this.sync.broadcastForkVote === 'function') {
+          setImmediate(() => this.sync.broadcastForkVote(payload).catch(() => {}));
+        }
+        return res.json({ ok: true, duplicate, vote_id: voteId, voter: voterAddress, block_hash: candidateHash, stake: stake.toString(), stake_cc: formatCcAmount(stake), tally });
+      } catch (e) {
+        return res.status(e.status || 400).json({ error: e.message || 'vote rejected' });
+      }
+    });
+
+    app.post('/api/node/vote/finalize', p2pLimiter, async (req, res) => {
+      const voteId = String((req.body || {}).vote_id || '').trim();
+      if (!voteId) return res.status(400).json({ error: 'vote_id required' });
+      const round = this.db.prepare('SELECT * FROM fork_vote_rounds WHERE vote_id = ?').get(voteId);
+      if (!round) return res.status(404).json({ error: 'vote round not found' });
+      if (round.status === 'finalized') {
+        return res.json({ ok: true, vote_id: voteId, result: round.result, hash: round.result_hash, finalized: true });
+      }
+      const tally = this._forkVoteTally(voteId);
+      if (!tally.length) return res.status(409).json({ error: 'cannot finalize a round with no votes' });
+      const claimed = this.db.prepare("UPDATE fork_vote_rounds SET status = 'finalizing' WHERE vote_id = ? AND status = 'pending'").run(voteId);
+      if (claimed.changes !== 1) return res.status(409).json({ error: 'vote round is already being finalized' });
+
+      let result = 'tie_no_reorg';
+      let resultHash = this.chain.bestHash;
+      let reorgApplied = false;
+      try {
+        const winner = tally[0];
+        const tied = tally.length > 1 && tally[0].stake === tally[1].stake;
+        const localTip = this.chain.getBlock(this.chain.height);
+        const reorgExpected = !tied
+          && safeInt(round.height, -1) === this.chain.height
+          && localTip
+          && winner.block_hash !== String(localTip.hash).toLowerCase();
+        this.db.prepare("UPDATE fork_vote_rounds SET result = ?, result_hash = ? WHERE vote_id = ? AND status = 'finalizing'")
+          .run(reorgExpected ? 'reorg_pending' : 'refund_pending', reorgExpected ? winner.block_hash : '', voteId);
+        if (safeInt(round.height, -1) !== this.chain.height) {
+          result = 'stale_no_reorg';
+        } else if (!tied && localTip && winner.block_hash !== String(localTip.hash).toLowerCase()) {
+          const candidateRow = this.db.prepare('SELECT block_json FROM fork_vote_candidates WHERE vote_id = ? AND block_hash = ?').get(voteId, winner.block_hash);
+          if (!candidateRow) throw new Error('winning candidate block is not available');
+          let candidate;
+          try { candidate = JSON.parse(candidateRow.block_json); } catch { throw new Error('winning candidate block is corrupted'); }
+          const reorg = await this.chain.reorganize(candidate, false, true);
+          if (!reorg.ok) throw new Error(reorg.motivo || 'vote-selected reorg failed');
+          reorgApplied = true;
+          result = 'reorganized';
+          resultHash = reorg.hash || this.chain.bestHash;
+        } else if (!tied) {
+          result = 'already_on_winner';
+        }
+        this._finishForkVote(voteId, result, resultHash, reorgApplied);
+        if (!(req.body || {})._relayed && this.sync && typeof this.sync.broadcastForkVoteFinalize === 'function') {
+          setImmediate(() => this.sync.broadcastForkVoteFinalize({ vote_id: voteId, _relayed: true }).catch(() => {}));
+        }
+        return res.json({ ok: true, vote_id: voteId, result, winner: tied ? null : winner.block_hash, tally, hash: resultHash, finalized: true });
+      } catch (e) {
+        this._finishForkVote(voteId, 'failed_no_reorg', this.chain.bestHash, false);
+        return res.status(409).json({ ok: false, vote_id: voteId, error: e.message || 'vote finalization failed', tally });
+      }
     });
 
     app.post('/api/node/forge', requireAdmin, async (req, res) => {
