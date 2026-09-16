@@ -919,15 +919,6 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json({ vote_id, approve: true, reason: 'accepted', voter_address: this.cfg.minerAddress || '', stake: 0 });
     });
 
-    app.post('/api/plots/add', requireAdmin, (req, res) => {
-      const { miner, plot_id, size_gb, merkle_root = '' } = req.body;
-      if (!miner || !plot_id || !size_gb) return res.status(400).json({ error: 'miner, plot_id, size_gb required' });
-      this.db.prepare('INSERT OR IGNORE INTO plot_commitments (plot_id, miner, merkle_root, size_gb, created_at) VALUES (?,?,?,?,?)').run(plot_id, miner, merkle_root, parseFloat(size_gb), Math.floor(Date.now() / 1000));
-      log('info', `[MINERS] Plot added: miner=${miner}, plot_id=${plot_id}, size_gb=${size_gb}`);
-      res.json({ ok: true, plot_id, miner });
-    });
-    app.delete('/api/plots/:id', requireAdmin, (req, res) => { this.db.prepare('DELETE FROM plot_commitments WHERE plot_id = ?').run(req.params.id); res.json({ ok: true }); });
-
     app.post('/api/node/forge', requireAdmin, async (req, res) => {
       const challenge = this.challengeMgr.getOrCreate();
       if (!challenge) return res.status(400).json({ error: 'no challenge' });
