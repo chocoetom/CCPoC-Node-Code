@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 'use strict';
 
-// Backward-compatible entry point — re-exports from src/
 const { ChocoNode, NodeRegistry } = require('./src/bootstrap/node');
 const { loadConfig, saveConfig, normalizeUrl, normalizeSeedPeers, log, setLogLevel, getLogBuffer, BASE_DIR, CONFIG_PATH } = require('./config/config');
 const crypto_utils = require('./src/crypto-utils/crypto');
@@ -11,7 +10,6 @@ const { Chain } = chain;
 const challenge = require('./src/Blockchain/challenge');
 const { PeerManager } = require('./src/P2P/peers');
 const sync = require('./src/P2P/sync');
-const plot = require('./src/crypto-utils/plot');
 const { DiscoveryServer, connectDiscoveryServer } = require('./src/P2P/discovery');
 const { Server } = require('./src/api/server');
 
@@ -40,11 +38,9 @@ function computeBaseFee(activeMiners = 1, parentGasUsed, parentGasLimit) {
 function suggestedGasPrice(activeMiners = 1) { return computeBaseFee(activeMiners); }
 function computeFee(gasLimit, gasPrice, priorityFee = 0) { return gasLimit * gasPrice + priorityFee; }
 
-const { ChallengeManager, TIERS, TIER_REWARD_PCT, getTier, computeBaseTargetWithTier } = challenge;
+const { ChallengeManager } = challenge;
 const { initDB } = db;
-const { buildPocProof, computePlotMerkleRoot, createPlotFile } = plot;
 
-// Self-test
 function main() {
   const cfg = loadConfig();
   setLogLevel(cfg.logLevel);
@@ -52,7 +48,6 @@ function main() {
   node.start();
 }
 
-// Export everything
 module.exports = {
   // Config
   loadConfig, saveConfig, normalizeUrl, normalizeSeedPeers, log, setLogLevel, getLogBuffer, BASE_DIR, CONFIG_PATH,
@@ -65,10 +60,6 @@ module.exports = {
   computeDeadline, deriveSampleIndexes, getChainWorkForBlock,
   // Fees
   GWEI, TX_GAS, computeBaseFee, suggestedGasPrice, computeFee,
-  // Tiers
-  TIERS, TIER_REWARD_PCT, getTier, computeBaseTargetWithTier,
-  // Plot
-  buildPocProof, computePlotMerkleRoot, createPlotFile,
   // DB
   initDB,
   // Discovery
