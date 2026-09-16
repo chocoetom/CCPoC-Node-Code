@@ -30,7 +30,7 @@ function loadConfig() {
   const defaults = {
     port: 3001,
     nodeUrl: null,
-    seedPeers: ['https://seed1.chocohub.org/', 'https://seed2.chocohub.org/],
+    seedPeers: ['https://seed1.chocohub.org/'],
     dbPath: path.join(BASE_DIR, 'db', 'choco-node.db'),
     dataDir: path.join(BASE_DIR, 'node-data'),
     plotsDir: path.join(BASE_DIR, 'plots'),
