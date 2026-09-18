@@ -89,12 +89,8 @@ function loadConfig() {
     upnpEnabled: true,
     discoveryUrl: '',
     discoveryPort: 7777,
-smartContractsEnabled: false,
-  optionalModulesAsked: false,
+smartContractsEnabled: true,
   corsOrigins: [],
-  p2pExchangeEnabled: false,
-  maxP2POffersPerUser: 50,
-  p2pOfferTtlSec: 86400,
   p2pWsPort: 0,
   };
 
