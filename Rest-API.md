@@ -1,8 +1,6 @@
 # CCPoC Node — REST API
 
-A plain-language guide to the HTTP API that every CCPoC node exposes.
-
-## What's inside
+## Summary
 
 1. [Auth (Admin)](#1-auth-admin)
 2. [Rate Limiting](#2-rate-limiting)
