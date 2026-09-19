@@ -49,10 +49,6 @@ These are the admin-only endpoints:
 | POST | `/api/node/settings` | Change the node's config |
 | GET | `/api/logs` | Read the node's recent logs |
 | GET | `/api/admin/wallets` | List wallets |
-| POST | `/api/stake` | Stake (placeholder for now) |
-| POST | `/api/p2p/offers/:id/take` | Take an exchange offer |
-| POST | `/api/p2p/offers/:id/claim` | Claim an exchange offer |
-| POST | `/api/p2p/offers/:id/refund` | Refund an exchange offer |
 
 Everything else is public.
 
