@@ -3,12 +3,12 @@
  # Summary
 
  1. Auth (Admin)
- 2. Node and Chain Stats
+ 2. Rate Limiting
  3. Mining and Registering
  4. Transactions
  5. Smart Contracts
  6. Json-RPC (aka Ethereum-json-rpc)
- 7. Rate-Limiting
+ 7. Node and Chain state
 
 ### Auth 
 
@@ -21,3 +21,11 @@ Endpoints that require an **Admin Token**:
 > /api/poc/register_plot (admin version, there is a public one too.)
 > /api/contracts/:address/snapshot
 > /api/logs
+
+### Rate Limiting 
+
+Node code have an universal **Rate Limiting** for endpoints, being 100R in a 60000ms window (60s)
+
+### Mining and Registering
+
+
