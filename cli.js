@@ -95,7 +95,7 @@ async function nodeStart() {
   }
   const child = spawn('node', ['chocohub.js'], {
     detached: true,
-    stdio: ['ignore', 'ignore', 'ignore'],
+    stdio: ['ignore', 'inherit', 'inherit'],
     cwd: BASE_DIR
   });
   child.unref();
