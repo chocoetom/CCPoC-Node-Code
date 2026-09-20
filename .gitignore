@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+*.node
+build/
+*.o
+*.a
+*.mk
+
+# Runtime data
+*.db
+*.db-*
+node.pid
+*.log
+*.pid
+
+# Local config
+config/config.env
+config/node_config.json
+node-data/
+plots/
+snapshots/
+db/
+
+# IDE/OS
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Optional modules
+optional_modules/

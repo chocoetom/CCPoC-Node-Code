@@ -75,10 +75,7 @@ function initDB(dbPath, cfg) {
     CREATE TABLE IF NOT EXISTS challenge_submissions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       challenge_id TEXT, miner TEXT, plot_id TEXT, size_gb REAL,
-      deadline INTEGER, proof_digest TEXT, submitted_at INTEGER,
-      reward_recipient TEXT, delegation_signature TEXT,
-      reward_recipient TEXT,
-      delegation_signature TEXT
+      deadline INTEGER, proof_digest TEXT, submitted_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_sub_challenge ON challenge_submissions(challenge_id);
     CREATE UNIQUE INDEX IF NOT EXISTS ux_sub_challenge_plot ON challenge_submissions(challenge_id, miner, plot_id, deadline);
@@ -157,8 +154,6 @@ function initDB(dbPath, cfg) {
     );
   `);
   try { db.prepare('ALTER TABLE peers ADD COLUMN timeout_until INTEGER DEFAULT 0').run(); } catch {}
-try { db.prepare('ALTER TABLE challenge_submissions ADD COLUMN reward_recipient TEXT').run(); } catch {}
-try { db.prepare('ALTER TABLE challenge_submissions ADD COLUMN delegation_signature TEXT').run(); } catch {}
 
   try {
     db.prepare(`
