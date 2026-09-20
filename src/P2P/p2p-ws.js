@@ -2,6 +2,31 @@ const WebSocket = require('ws');
 const { verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { log } = require('../../config/config');
 
+class LRUCache {
+  constructor(maxSize = 1000) {
+    this.maxSize = maxSize;
+    this.map = new Map();
+  }
+
+  get(key) {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key);
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value;
+      this.map.delete(oldestKey);
+    }
+    this.map.set(key, value);
+  }
+}
+
 class P2PWebSocketServer {
   constructor(port, chain, sync, peers) {
     this.port = port;
@@ -11,8 +36,8 @@ class P2PWebSocketServer {
     this.wss = null;
     this.clients = new Map();
     this._messageHandlers = new Map();
-    this._blockRateLimiter = new Map();
-    this._txRateLimiter = new Map();
+    this._blockRateLimiter = new LRUCache(10000);
+    this._txRateLimiter = new LRUCache(10000);
     this._setupHandlers();
   }
 

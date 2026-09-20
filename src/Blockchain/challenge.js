@@ -95,10 +95,26 @@ class ChallengeManager {
       }
     }
 
-    const insertRes = this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at) VALUES (?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now);
+    let rewardRecipient = miner;
+    let delegationSig = '';
+
+    if (proofPacket.reward_recipient && proofPacket.delegation_signature) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(proofPacket.reward_recipient)) {
+        return { ok: false, motivo: 'invalid reward_recipient address' };
+      }
+      const msg = `${challengeId}:${proofPacket.reward_recipient}`;
+      const pkRow = this.db.prepare('SELECT public_key_secp256k1 FROM users WHERE lower(address) = lower(?)').get(miner);
+      if (!pkRow || !pkRow.public_key_secp256k1 || !verifySignature(msg, proofPacket.delegation_signature, pkRow.public_key_secp256k1)) {
+        return { ok: false, motivo: 'invalid delegation signature' };
+      }
+      rewardRecipient = proofPacket.reward_recipient;
+      delegationSig = proofPacket.delegation_signature;
+    }
+
+    const insertRes = this.db.prepare('INSERT OR IGNORE INTO challenge_submissions (challenge_id, miner, plot_id, size_gb, deadline, proof_digest, proof_signature, submitted_at, reward_recipient, delegation_signature) VALUES (?,?,?,?,?,?,?,?,?,?)').run(challengeId, miner, plotId, sizeGb, deadline, expectedDigest, proofSig, now, rewardRecipient, delegationSig);
     if (insertRes.changes > 0 && /^[0-9a-fA-F]{64}$/.test(proofPacket.scoop_data)) {
-      this.db.prepare('UPDATE challenge_submissions SET scoop_data = ?, scoop_index = ?, total_scoops = ?, merkle_proof = ?, merkle_root = ? WHERE challenge_id = ? AND miner = ? AND plot_id = ? AND deadline = ?')
-        .run(String(proofPacket.scoop_data), safeInt(proofPacket.scoop_index, 0), safeInt(proofPacket.total_scoops, 0), JSON.stringify(merkleProof || []), String(committedRoot || ''), challengeId, miner, plotId, deadline);
+      this.db.prepare('UPDATE challenge_submissions SET scoop_data = ?, scoop_index = ?, total_scoops = ?, merkle_proof = ?, merkle_root = ?, reward_recipient = ?, delegation_signature = ? WHERE challenge_id = ? AND miner = ? AND plot_id = ? AND deadline = ?')
+        .run(String(proofPacket.scoop_data), safeInt(proofPacket.scoop_index, 0), safeInt(proofPacket.total_scoops, 0), JSON.stringify(merkleProof || []), String(committedRoot || ''), rewardRecipient, delegationSig, challengeId, miner, plotId, deadline);
     }
     const updated = this.db.prepare('UPDATE mining_challenges SET winner_miner = ?, winner_deadline = ?, winner_plot_id = ?, finalized_at = ? WHERE challenge_id = ? AND (winner_deadline IS NULL OR ? < winner_deadline)').run(miner, deadline, plotId, now, challengeId, deadline);
     const subCount = this.db.prepare('SELECT COUNT(*) as cnt FROM challenge_submissions WHERE challenge_id = ?').get(challengeId).cnt;
@@ -323,9 +339,12 @@ class ChallengeManager {
       log('error', `[FORGE] Cannot forge challenge ${challenge.challenge_id.slice(0, 12)}: winner d=${winner.deadline}s from ${(winner.miner || '').slice(0, 10)}… but this node has no minerPrivateKey/minerAddress configured`);
       return null;
     }
+    const sub = this.db.prepare('SELECT reward_recipient FROM challenge_submissions WHERE challenge_id = ? AND miner = ? AND plot_id = ?').get(challenge.challenge_id, winner.miner, winner.plot_id);
+    const payoutAddress = (sub && sub.reward_recipient) ? sub.reward_recipient : winner.miner;
+
     const totalReward = calculateMiningReward(chain.height + 1, this.cfg);
     const distribution = [{
-      miner: (winner.miner || '').toLowerCase(),
+      miner: payoutAddress,
       plot_id: winner.plot_id || '',
       size_gb: winner.size_gb,
       deadline: winner.deadline,

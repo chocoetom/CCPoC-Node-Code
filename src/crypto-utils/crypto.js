@@ -472,14 +472,28 @@ function hashTransaction(tx) {
   return sha256hex(JSON.stringify(d, Object.keys(d).sort()));
 }
 
-function proofMessage(challengeId, miner, deadline, plotId) {
-  return JSON.stringify({
+function proofMessage(challengeId, miner, deadline, plotId, rewardRecipient = '') {
+  const payload = {
     type: 'poc_proof',
     challenge_id: String(challengeId),
     miner: String(miner).toLowerCase(),
     deadline: String(deadline),
     plot_id: String(plotId),
-  }, ['type', 'challenge_id', 'miner', 'deadline', 'plot_id'].sort());
+  };
+  if (rewardRecipient) {
+    payload.reward_recipient = String(rewardRecipient).toLowerCase();
+  }
+  const keys = Object.keys(payload).sort();
+  return JSON.stringify(payload, keys);
+}
+
+function poolDelegationMessage(challengeId, miner, rewardRecipient) {
+  return JSON.stringify({
+    type: 'pool_delegation',
+    challenge_id: String(challengeId),
+    miner: String(miner).toLowerCase(),
+    reward_recipient: String(rewardRecipient).toLowerCase(),
+  }, ['challenge_id', 'miner', 'reward_recipient', 'type']);
 }
 
 function plotRegisterMessage(miner, plotId, merkleRoot, sizeGb, totalScoops) {

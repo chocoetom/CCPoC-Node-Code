@@ -1,6 +1,6 @@
 const path = require('path');
 const { safeInt, safeBigInt, hashTransaction, pubkeyToAddress, calculateMiningReward, verifySignature, plotRegisterMessage, forkVoteMessage, evmTxHash, recoverTransactionSender, vrfProve, vrfVerify } = require('../crypto-utils/crypto');
-const { log, getLogBuffer } = require('../../config/config');
+const { log } = require('../../config/config');
 const MAX_PLOT_GB = require('../crypto-utils/plot-capacity').MAX_PLOT_GB;
 const { makeLocalAnnouncement, verifyAnnouncement } = require('../crypto-utils/plot-capacity');
 const { estimateIntrinsicGas, minimumFee } = require('../consensus/gas');
@@ -504,10 +504,12 @@ app.get('/api/state', (req, res) => {
     });
 
     app.post('/api/mining/submit-proof', mutationLimiter, (req, res) => {
-      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
+      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature, reward_recipient, delegation_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      if (reward_recipient) packet.reward_recipient = reward_recipient;
+      if (delegation_signature) packet.delegation_signature = delegation_signature;
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       if (!result.ok) return res.status(400).json({ error: result.motivo });
       log('info', `[MINERS] Proof submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
@@ -798,8 +800,6 @@ const validation = await this.chain.validateTxForMempool(tx);
       res.json({ ok: true, config: sanitized });
     });
 
-    app.get('/api/logs', requireAdmin, (req, res) => res.json({ logs: getLogBuffer() }));
-
     app.post('/api/node/broadcast/block', p2pLimiter, async (req, res) => {
       const block = req.body.block;
       if (!block) return res.status(400).json({ error: 'block required' });
@@ -840,10 +840,12 @@ const validation = await this.chain.validateTxForMempool(tx);
     });
 
     app.post('/api/challenge/submit', mutationLimiter, (req, res) => {
-      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature } = req.body;
+      const { challenge_id, miner, plot_id, deadline, proof_packet, proof_signature, reward_recipient, delegation_signature } = req.body;
       if (!challenge_id || !miner || !plot_id || deadline == null) return res.status(400).json({ error: 'challenge_id, miner, plot_id, deadline required' });
       const packet = proof_packet || {};
       if (proof_signature && !packet.proof_signature) packet.proof_signature = proof_signature;
+      if (reward_recipient) packet.reward_recipient = reward_recipient;
+      if (delegation_signature) packet.delegation_signature = delegation_signature;
       const result = this.challengeMgr.submitProof(this.chain, challenge_id, miner, plot_id, safeInt(deadline, -1), packet);
       log('info', `[MINERS] Challenge submit: miner=${miner}, plot_id=${plot_id}, deadline=${deadline}, result=${result.ok ? 'accepted' : 'rejected'}, reason=${result.motivo}`);
       res.json(result);
